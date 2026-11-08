@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # Core repositories: official frappe/erpnext only.
 
 APP_NAME="Green ERPNext Installer"
-APP_VERSION="3.0.46"
+APP_VERSION="3.1.2"
 FRAPPE_REPO="https://github.com/frappe/frappe.git"
 ERPNEXT_REPO="https://github.com/frappe/erpnext.git"
 PAYMENTS_REPO="https://github.com/frappe/payments.git"
@@ -145,6 +145,7 @@ SOCKETIO_PORT=""
 REDIS_QUEUE_PORT=""
 REDIS_CACHE_PORT=""
 FILE_WATCHER_PORT=""
+OPTIONAL_APPS_SELECTED=()
 
 TEMP_REDIS_QUEUE_STARTED=0
 TEMP_REDIS_CACHE_STARTED=0
@@ -208,7 +209,8 @@ require_user() {
   [[ "${EUID}" -ne 0 ]] || die "Do not run the installer as root. Start it from a normal sudo-enabled account."
   command -v sudo >/dev/null 2>&1 || die "sudo is required."
   if [[ "${GREEN_DEDICATED_USER:-0}" == "1" ]]; then
-    sudo -n true || die "Dedicated Frappe user does not have non-interactive sudo access."
+    sudo -n -l >/dev/null 2>&1 || die "Dedicated Frappe user sudoers rule is missing or invalid."
+    sudo -n true || die "Dedicated Frappe user cannot run passwordless sudo; refusing to continue."
   else
     sudo -v </dev/tty || die "Current login user cannot obtain sudo privileges."
   fi
@@ -223,8 +225,8 @@ validate_linux_username() {
 setup_frappe_user() {
   if [[ "${GREEN_DEDICATED_USER:-0}" == "1" ]]; then
     FRAPPE_USER="$(id -un)"
-    # Dedicated user already has NOPASSWD sudo from bootstrap; never ask for its password.
-    sudo -n true || die "Dedicated Frappe user does not have non-interactive sudo access."
+    # The bootstrap phase has installed and tested a dedicated NOPASSWD rule.
+    sudo -n true || die "Dedicated Frappe user sudo test failed after account hand-off."
     return 0
   fi
 
@@ -270,16 +272,23 @@ setup_frappe_user() {
     sudo usermod -aG sudo "$FRAPPE_USER"
   fi
 
-  local sudoers_file="/etc/sudoers.d/green-erpnext-$FRAPPE_USER"
+  local sudoers_file="/etc/sudoers.d/zz-green-erpnext-$FRAPPE_USER"
+  # Installer system tasks (apt, services, nginx, Supervisor) run from this
+  # dedicated account. Use a dedicated, validated rule; do not rely on sudo-group
+  # membership or a cached password across a long installation.
   printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$FRAPPE_USER" | sudo tee "$sudoers_file" >/dev/null
+  sudo chown root:root "$sudoers_file"
   sudo chmod 0440 "$sudoers_file"
-  sudo visudo -cf "$sudoers_file" >/dev/null || die "Generated sudoers entry failed validation."
+  sudo visudo -c >/dev/null || die "System sudoers validation failed after creating the Frappe rule."
+  sudo -l -U "$FRAPPE_USER" | grep -q 'NOPASSWD: ALL' || die "Sudoers did not grant the required non-interactive privilege to $FRAPPE_USER."
+  sudo -u "$FRAPPE_USER" -H sudo -n true || die "Passwordless sudo test failed for $FRAPPE_USER before hand-off."
 
-  # Required ERPNext home permissions. Keep exactly as requested.
-  sudo chmod o+x "/home/$FRAPPE_USER"
-  sudo chmod -R o+rx "/home/$FRAPPE_USER"
-  sudo chown -R "$FRAPPE_USER:$FRAPPE_USER" "/home/$FRAPPE_USER"
-  ok "Dedicated user permissions ready: chmod -R o+rx /home/$FRAPPE_USER"
+  # Do NOT recursively expose the entire home directory: it may contain SSH
+  # keys, credentials, site_config.json and private attachments. Only make the
+  # home path traversable; public Bench assets are opened safely after creation.
+  sudo chown "$FRAPPE_USER:$FRAPPE_USER" "/home/$FRAPPE_USER"
+  sudo chmod 0751 "/home/$FRAPPE_USER"
+  ok "Dedicated account, sudoers syntax, actual sudo execution and home traversal validated."
 
   # Re-enter only once, explicitly attaching the dedicated process to the real TTY.
   # The child then owns the interactive prompts and installation; the parent never resumes main().
@@ -288,7 +297,10 @@ setup_frappe_user() {
   sudo chown "$FRAPPE_USER:$FRAPPE_USER" "$bootstrap"
   sudo chmod 0755 "$bootstrap"
   info "Switching installer execution to $FRAPPE_USER for a clean Frappe installation."
-  exec sudo -n -iu "$FRAPPE_USER" env GREEN_DEDICATED_USER=1 GREEN_LOCK_INHERITED=1 GREEN_UI_OWNER=1 bash "$bootstrap" </dev/tty
+  # Do not use sudo -n for the account switch: -n suppresses the original
+  # administrator's password prompt and caused the reported first-step failure.
+  # The target user's own NOPASSWD rule is tested above and again in the child.
+  exec sudo -iu "$FRAPPE_USER" env GREEN_DEDICATED_USER=1 GREEN_LOCK_INHERITED=1 GREEN_UI_OWNER=1 bash "$bootstrap" </dev/tty
 }
 
 ask_settings() {
@@ -374,6 +386,29 @@ ask_settings() {
   echo
   read -rp "  Configure production services (nginx + supervisor)? [y/N]: " PRODUCTION
   PRODUCTION="${PRODUCTION:-n}"
+
+  section "Optional official Frappe apps"
+  local app_answer
+  OPTIONAL_APPS_SELECTED=()
+  read -rp "  Install Frappe HR (hrms)? [y/N]: " app_answer
+  if [[ "$app_answer" =~ ^[Yy]$ ]]; then
+    OPTIONAL_APPS_SELECTED+=(hrms)
+  fi
+
+  read -rp "  Install Education? [y/N]: " app_answer
+  if [[ "$app_answer" =~ ^[Yy]$ ]]; then
+    OPTIONAL_APPS_SELECTED+=(education)
+  fi
+
+  read -rp "  Install Healthcare? [y/N]: " app_answer
+  if [[ "$app_answer" =~ ^[Yy]$ ]]; then
+    OPTIONAL_APPS_SELECTED+=(healthcare)
+  fi
+
+  # With `set -e`, the final false test in a `[[ ... ]] && ...` list can
+  # propagate a non-zero function status and terminate the whole installer.
+  # Return success explicitly regardless of the user's optional-app choices.
+  return 0
 }
 
 reset_mariadb() {
@@ -454,29 +489,47 @@ install_wkhtmltopdf() {
   fi
 
   step "2c/9" "Installing wkhtmltopdf 0.12.6.1 (patched Qt)"
-  local arch deb url tmp
+  local arch distro_asset deb url tmp
   case "$(uname -m)" in
     x86_64) arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
     *) die "Unsupported CPU architecture for wkhtmltopdf: $(uname -m)" ;;
   esac
 
-  deb="wkhtmltox_0.12.6.1-2.jammy_${arch}.deb"
-  url="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/${deb}"
+  # Upstream's final patched-Qt packages are built for Jammy and Bookworm.
+  # Jammy's OpenSSL 3 build runs on Ubuntu 24.04; Bookworm package is used on Debian 13.
+  if [[ "$OS_ID" == "ubuntu" ]]; then
+    distro_asset="jammy"
+    local jpeg_runtime="libjpeg-turbo8"
+  else
+    distro_asset="bookworm"
+    local jpeg_runtime="libjpeg62-turbo"
+  fi
+  deb="wkhtmltox_0.12.6.1-3.${distro_asset}_${arch}.deb"
+  url="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/${deb}"
   tmp="/tmp/${deb}"
 
+  sudo apt-get remove -y wkhtmltopdf >/dev/null 2>&1 || true
+  sudo apt-get install -y xfonts-75dpi xfonts-base fontconfig libfontconfig1 libfreetype6 "$jpeg_runtime" libx11-6 libxext6 libxrender1
   sudo rm -f "$tmp"
-  curl -fL --retry 3 --retry-delay 2 "$url" -o "$tmp"
-  sudo dpkg -i "$tmp" || true
-  sudo apt-get -f install -y
-  sudo dpkg -i "$tmp" || true
-  sudo apt-get -f install -y
+  curl -fL --retry 3 --retry-delay 2 "$url" -o "$tmp" || die "Could not download the patched-Qt wkhtmltopdf package: $url"
+  sudo apt-get install -y "$tmp" || {
+    sudo apt-get -f install -y
+    sudo apt-get install -y "$tmp"
+  }
   sudo rm -f "$tmp"
+  hash -r
 
-  command -v wkhtmltopdf >/dev/null 2>&1 || die "wkhtmltopdf installation failed."
-  wkhtmltopdf --version | grep -qi "patched qt" \
+  [[ -x /usr/local/bin/wkhtmltopdf ]] || die "Patched wkhtmltopdf binary was not installed at /usr/local/bin/wkhtmltopdf."
+  export PATH="/usr/local/bin:$PATH"
+  [[ "$(/usr/local/bin/wkhtmltopdf --version 2>&1)" == *"patched qt"* ]] \
     || die "wkhtmltopdf was installed, but the required patched Qt build was not detected."
-  ok "wkhtmltopdf ready: $(wkhtmltopdf --version)"
+  local pdf_test="/tmp/green-wkhtmltopdf-test-$$.pdf"
+  /usr/local/bin/wkhtmltopdf --quiet about:blank "$pdf_test" >/dev/null 2>&1 \
+    || die "Patched wkhtmltopdf is present but failed its PDF rendering smoke test."
+  [[ -s "$pdf_test" ]] || die "wkhtmltopdf smoke test did not produce a PDF file."
+  rm -f "$pdf_test"
+  ok "wkhtmltopdf ready and PDF smoke test passed: $(/usr/local/bin/wkhtmltopdf --version)"
 }
 
 configure_mariadb() {
@@ -564,9 +617,8 @@ install_uv() {
 
   PYTHON_BIN="$(uv python find "${py_target}")"
   "$PYTHON_BIN" --version
-  command -v python3 >/dev/null 2>&1 || die "python3 is not available after uv installation."
-  [[ "$(python3 --version 2>&1)" == "Python ${py_target}"* ]] || \
-    die "python3 is not the selected Python ${py_target} runtime: $(python3 --version 2>&1)"
+  [[ "$($PYTHON_BIN -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" == "$py_target" ]] \
+    || die "uv selected an unexpected Python interpreter: $PYTHON_BIN"
   uv --version
   ok "Python runtime ready: $PYTHON_BIN"
 }
@@ -632,7 +684,7 @@ verify_v16_prerequisites() {
   [[ "$ERP_VERSION" -eq 16 ]] || return 0
   section "v16 prerequisite verification"
   step "6b/9" "Verifying Frappe v16 runtime requirements"
-  [[ "$(python3 --version 2>&1)" == "Python 3.14"* ]] || die "Frappe v16 requires Python 3.14; detected $(python3 --version 2>&1)."
+  [[ "$($PYTHON_BIN -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" == "3.14" ]] || die "Frappe v16 requires Python 3.14; detected $($PYTHON_BIN --version 2>&1)."
   [[ "$(node --version 2>&1)" == v24.* ]] || die "Frappe v16 requires Node 24; detected $(node --version 2>&1)."
   command -v npm >/dev/null 2>&1 || die "npm is missing from the active PATH."
   [[ "$(yarn --version 2>&1)" == 1.22.* ]] || die "Frappe v16 requires Yarn 1.22+; detected $(yarn --version 2>&1)."
@@ -649,7 +701,7 @@ install_bench() {
   export PATH="$HOME/.local/bin:$PATH"
   if ! command -v bench >/dev/null 2>&1; then
     # Current Frappe guidance recommends uv tool for Bench.
-    uv tool install frappe-bench
+    uv tool install --python "$PYTHON_BIN" frappe-bench
   fi
   command -v bench >/dev/null || die "Bench CLI is not available on PATH."
   bench --version
@@ -848,11 +900,10 @@ official_app_available() {
 
 optional_apps() {
   section "Optional official Frappe apps"
-  local app branch answer
-  local -a apps=(hrms education healthcare)
+  local app branch
   local -A labels=([hrms]="Frappe HR" [education]="Education" [healthcare]="Healthcare")
 
-  for app in "${apps[@]}"; do
+  for app in "${OPTIONAL_APPS_SELECTED[@]}"; do
     branch="$(app_branch "$app")"
     [[ -n "$branch" ]] || continue
 
@@ -861,16 +912,10 @@ optional_apps() {
       continue
     fi
 
-    echo
-    read -rp "  Install ${labels[$app]} (${app})? [y/N]: " answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-      info "Installing ${labels[$app]} (${branch})"
-      bench get-app --branch "$branch" "${APP_REPO[$app]}"
-      bench --site "$SITE_NAME" install-app "$app"
-      ok "${labels[$app]} installed."
-    else
-      info "${labels[$app]} not selected."
-    fi
+    info "Installing selected ${labels[$app]} (${branch})"
+    bench get-app --branch "$branch" "${APP_REPO[$app]}"
+    bench --site "$SITE_NAME" install-app "$app"
+    ok "${labels[$app]} installed."
   done
 }
 
@@ -888,6 +933,50 @@ log_format main '$remote_addr - $remote_user [$time_local] "$request" '
                 '"$http_user_agent" "$http_x_forwarded_for"';
 EOF
   fi
+}
+
+
+configure_supervisor_socket() {
+  local conf="/etc/supervisor/supervisord.conf"
+  [[ -f "$conf" ]] || die "Supervisor configuration file not found: $conf"
+  sudo cp -a "$conf" "${conf}.green-backup-$(date +%Y%m%d-%H%M%S)"
+  sudo python3 - "$FRAPPE_USER" <<'PYCONF'
+import configparser, pathlib, sys
+user = sys.argv[1]
+path = pathlib.Path('/etc/supervisor/supervisord.conf')
+parser = configparser.ConfigParser(interpolation=None, strict=False)
+parser.read(path)
+if not parser.has_section('unix_http_server'):
+    parser.add_section('unix_http_server')
+parser.set('unix_http_server', 'file', '/var/run/supervisor.sock')
+parser.set('unix_http_server', 'chmod', '0760')
+parser.set('unix_http_server', 'chown', f'{user}:{user}')
+with path.open('w') as f:
+    parser.write(f)
+PYCONF
+  sudo chmod 0644 "$conf"
+  # The actual parser/service validation happens on the controlled restart below.
+  ok "Supervisor RPC socket permissions set to chmod=0760, chown=$FRAPPE_USER:$FRAPPE_USER."
+}
+
+secure_bench_public_permissions() {
+  # Keep credentials and private uploads private while allowing Nginx to read
+  # only static assets and public site files.
+  sudo chmod 0751 "/home/$FRAPPE_USER"
+  sudo chmod 0755 "$BENCH_DIR"
+  sudo chmod 0755 "$BENCH_DIR/sites"
+  sudo chmod -R o+rX "$BENCH_DIR/sites/assets" 2>/dev/null || true
+  if [[ -d "$BENCH_DIR/sites/$SITE_NAME/public" ]]; then
+    sudo chmod -R o+rX "$BENCH_DIR/sites/$SITE_NAME/public"
+  fi
+  if [[ -d "$BENCH_DIR/sites/$SITE_NAME/private" ]]; then
+    sudo chmod 0700 "$BENCH_DIR/sites/$SITE_NAME/private"
+    sudo chmod -R go-rwx "$BENCH_DIR/sites/$SITE_NAME/private"
+  fi
+  if [[ -f "$BENCH_DIR/sites/$SITE_NAME/site_config.json" ]]; then
+    sudo chmod 0640 "$BENCH_DIR/sites/$SITE_NAME/site_config.json"
+  fi
+  ok "Public web assets are readable; private uploads and site credentials remain restricted."
 }
 
 production_setup() {
@@ -925,6 +1014,7 @@ production_setup() {
   [[ -d "$supervisor_dir" ]] || supervisor_dir="/etc/supervisord.d"
   sudo mkdir -p "$supervisor_dir"
   sudo ln -sfn "$BENCH_DIR/config/supervisor.conf" "$supervisor_dir/$(basename "$BENCH_DIR").conf"
+  configure_supervisor_socket
 
   step "P3/4" "Generating Nginx configuration"
   bench setup nginx
@@ -935,9 +1025,7 @@ production_setup() {
   # Remove Ubuntu's default welcome server so it cannot win the port-80 match.
   sudo rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default
 
-  # Final production permission pass: required ERPNext home traversal/read/execute access.
-  sudo chmod o+x "/home/$FRAPPE_USER"
-  sudo chmod -R o+rx "/home/$FRAPPE_USER"
+  secure_bench_public_permissions
 
   step "P4/4" "Enabling and starting production services"
   sudo systemctl enable nginx supervisor mariadb
@@ -1004,7 +1092,7 @@ final_checks() {
   echo "  Frappe  : ${F_BRANCH[$ERP_VERSION]}"
   echo "  Bench   : $BENCH_DIR"
   echo "  Site    : $SITE_NAME"
-  echo "  User permissions: chmod -R o+rx /home/$FRAPPE_USER"
+  echo "  User permissions: private site files protected; public assets readable by Nginx"
   echo "  Log     : $LOG_FILE"
   echo
   if [[ "$PRODUCTION" =~ ^[Yy]$ ]]; then
