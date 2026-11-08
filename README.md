@@ -117,7 +117,7 @@ chmod +x green_erpnext_installer.sh
 Run:
 
 ```bash
-source green_erpnext_installer.sh
+bash green_erpnext_installer.sh
 ```
 
 The installer will guide you through the setup interactively.
