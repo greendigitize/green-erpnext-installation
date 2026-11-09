@@ -329,11 +329,10 @@ ask_settings() {
       info "Existing site configuration found for $SITE_NAME; it can be preserved when MariaDB is kept."
     fi
     echo
-    echo "  [1] Fresh installation — overwrite all, KEEP existing MariaDB/data"
+    echo "  [1] Fresh installation — overwrite Bench, KEEP existing MariaDB/data (with database backup)"
     echo "  [2] Fresh installation — overwrite all, INSTALL NEW MariaDB (DATA WILL BE ERASED)"
-    echo "  [3] Keep existing installation — do nothing"
-    echo "  [4] Cancel installation"
-    read -rp "  Select an option [1-4]: " install_choice
+    echo "  [3] Keep existing installation — exit without changes"
+    read -rp "  Select an option [1-3]: " install_choice
     case "$install_choice" in
       1) REUSE_EXISTING_DB=1 ;;
       2)
@@ -346,15 +345,31 @@ ask_settings() {
         info "Existing installation kept. Nothing will be changed."
         exit 0
         ;;
-      4)
-        echo "  Cancelled."; exit 0
-        ;;
       *) die "Invalid installation option." ;;
     esac
 
-    EXISTING_INSTALL_BACKUP="/tmp/green-erpnext-reinstall-$(date +%Y%m%d-%H%M%S)"
-    sudo mkdir -p "$EXISTING_INSTALL_BACKUP"
-    info "Moving the old Bench into a backup folder so site configuration and attachments remain recoverable."
+    EXISTING_INSTALL_BACKUP="/home/$FRAPPE_USER/green-erpnext-recovery-backups/$(date +%Y%m%d-%H%M%S)"
+    if [[ "$REUSE_EXISTING_DB" -eq 1 ]]; then
+      [[ -f "$EXISTING_SITE_CONFIG" ]] || die "Cannot preserve the database: site_config.json was not found for $SITE_NAME."
+      command -v mariadb-dump >/dev/null 2>&1 || die "mariadb-dump is required to back up the existing database."
+      local existing_db_name
+      existing_db_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("db_name", ""))' "$EXISTING_SITE_CONFIG")"
+      [[ -n "$existing_db_name" && "$existing_db_name" =~ ^[A-Za-z0-9_]+$ ]] || die "Could not safely read the database name from the existing site_config.json."
+      sudo mariadb -N -e "SELECT VERSION();" >/dev/null 2>&1 || die "Cannot access MariaDB through sudo/socket authentication; database backup cannot proceed."
+      sudo mkdir -p "$EXISTING_INSTALL_BACKUP"
+      sudo chown "$FRAPPE_USER:$FRAPPE_USER" "$(dirname "$EXISTING_INSTALL_BACKUP")" "$EXISTING_INSTALL_BACKUP"
+      chmod 0700 "$EXISTING_INSTALL_BACKUP"
+      info "Creating a verified SQL backup before moving or replacing the existing Bench."
+      sudo mariadb-dump --single-transaction --routines --triggers --events --databases "$existing_db_name" | gzip -c > "$EXISTING_INSTALL_BACKUP/${SITE_NAME}-database.sql.gz" \
+        || die "Database backup failed. Existing Bench and database have NOT been moved or modified."
+      [[ -s "$EXISTING_INSTALL_BACKUP/${SITE_NAME}-database.sql.gz" ]] || die "Database backup file is empty; refusing to continue."
+      gzip -t "$EXISTING_INSTALL_BACKUP/${SITE_NAME}-database.sql.gz" || die "Database backup verification failed; refusing to continue."
+      chmod 0600 "$EXISTING_INSTALL_BACKUP/${SITE_NAME}-database.sql.gz"
+      ok "Database backup created and verified: $EXISTING_INSTALL_BACKUP/${SITE_NAME}-database.sql.gz"
+    else
+      sudo mkdir -p "$EXISTING_INSTALL_BACKUP"
+    fi
+    info "Moving the old Bench into the recovery backup folder so site configuration, encryption key and attachments remain recoverable."
     sudo mv "$BENCH_DIR" "$EXISTING_INSTALL_BACKUP/bench"
     if [[ -f "$EXISTING_INSTALL_BACKUP/bench/sites/common_site_config.json" ]]; then
       sudo cp "$EXISTING_INSTALL_BACKUP/bench/sites/common_site_config.json" "$EXISTING_INSTALL_BACKUP/common_site_config.json"
@@ -363,19 +378,24 @@ ask_settings() {
     ok "Old ERPNext/Frappe installation moved aside; fresh Bench path is now available."
   fi
 
-  if [[ "$RESET_MARIADB" -eq 1 ]]; then
-    read -rsp "  New MariaDB root password: " DB_ROOT_PASSWORD; echo
-    read -rsp "  Confirm new MariaDB root password: " DB_ROOT_PASSWORD_2; echo
-  elif command -v mariadb >/dev/null 2>&1; then
-    read -rsp "  Enter existing MariaDB root password: " DB_ROOT_PASSWORD; echo
-    read -rsp "  Confirm MariaDB root password: " DB_ROOT_PASSWORD_2; echo
+  if [[ "$REUSE_EXISTING_DB" -eq 1 ]]; then
+    DB_ROOT_PASSWORD=""
+    info "Existing MariaDB credentials will be preserved; no MariaDB root password is required or changed."
   else
-    read -rsp "  New MariaDB root password: " DB_ROOT_PASSWORD; echo
-    read -rsp "  Confirm new MariaDB root password: " DB_ROOT_PASSWORD_2; echo
+    if [[ "$RESET_MARIADB" -eq 1 ]]; then
+      read -rsp "  New MariaDB root password: " DB_ROOT_PASSWORD; echo
+      read -rsp "  Confirm new MariaDB root password: " DB_ROOT_PASSWORD_2; echo
+    elif command -v mariadb >/dev/null 2>&1; then
+      read -rsp "  Enter existing MariaDB root password: " DB_ROOT_PASSWORD; echo
+      read -rsp "  Confirm MariaDB root password: " DB_ROOT_PASSWORD_2; echo
+    else
+      read -rsp "  New MariaDB root password: " DB_ROOT_PASSWORD; echo
+      read -rsp "  Confirm new MariaDB root password: " DB_ROOT_PASSWORD_2; echo
+    fi
+    [[ "$DB_ROOT_PASSWORD" == "$DB_ROOT_PASSWORD_2" && -n "$DB_ROOT_PASSWORD" ]] \
+      || die "MariaDB passwords do not match or are empty."
+    unset DB_ROOT_PASSWORD_2
   fi
-  [[ "$DB_ROOT_PASSWORD" == "$DB_ROOT_PASSWORD_2" && -n "$DB_ROOT_PASSWORD" ]] \
-    || die "MariaDB passwords do not match or are empty."
-  unset DB_ROOT_PASSWORD_2
 
   read -rsp "  Enter ERPNext Administrator password: " ADMIN_PASSWORD; echo
   read -rsp "  Confirm ERPNext Administrator password: " ADMIN_PASSWORD_2; echo
@@ -547,6 +567,29 @@ EOF
   step "4/9" "Configuring Frappe-compatible MariaDB authentication"
   local mariadb_version escaped
 
+  # Recovery mode is strictly read-only for MariaDB authentication and data.
+  # The SQL dump was completed and verified before the old Bench was moved.
+  if [[ "$REUSE_EXISTING_DB" -eq 1 ]]; then
+    step "4/9" "Verifying existing MariaDB without changing credentials or configuration"
+    sudo mariadb -N -e "SELECT VERSION();" >/tmp/green_mariadb_version 2>/dev/null \
+      || die "Cannot access the existing MariaDB through sudo/socket authentication. Existing database was not modified."
+    mariadb_version="$(head -1 /tmp/green_mariadb_version)"
+    rm -f /tmp/green_mariadb_version
+    [[ -n "$mariadb_version" ]] || die "Unable to read the existing MariaDB version."
+    ok "Existing MariaDB preserved: ${mariadb_version} (no password or authentication changes)."
+  else
+    step "3/9" "Applying utf8mb4 configuration"
+    sudo tee /etc/mysql/mariadb.conf.d/99-green-erpnext.cnf >/dev/null <<'EOF'
+[mysqld]
+character-set-client-handshake = FALSE
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+bind-address = 127.0.0.1
+EOF
+    sudo systemctl restart mariadb
+
+    step "4/9" "Configuring Frappe-compatible MariaDB authentication"
+
   # MariaDB 10.4+ commonly creates root@localhost with unix_socket as the
   # primary authentication method. A password supplied to the CLI while
   # running as OS root can therefore appear to work even though a non-root
@@ -574,6 +617,7 @@ EOF
   rm -f /tmp/green_mariadb_version
   [[ -n "$mariadb_version" ]] || die "Unable to verify MariaDB version over TCP."
   ok "MariaDB ready: ${mariadb_version} (TCP root authentication verified)"
+  fi
 
   local db_core="${mariadb_version%%-*}"
   db_core="${db_core#1:}"
@@ -691,7 +735,8 @@ verify_v16_prerequisites() {
   command -v redis-server >/dev/null 2>&1 || die "Redis is missing."
   command -v wkhtmltopdf >/dev/null 2>&1 || die "wkhtmltopdf is missing."
   wkhtmltopdf --version 2>&1 | grep -qi "patched qt" || die "wkhtmltopdf must be the patched Qt build."
-  command -v cron >/dev/null 2>&1 || die "cron is missing."
+  dpkg-query -W -f='${Status}' cron 2>/dev/null | grep -q '^install ok installed$' || die "cron package is not installed."
+  [[ -x /usr/sbin/cron ]] || command -v cron >/dev/null 2>&1 || die "cron executable is missing."
   ok "v16 prerequisites verified: Python 3.14 | Node 24 | npm | Yarn 1.22+ | Redis | patched wkhtmltopdf | cron"
 }
 
@@ -826,8 +871,7 @@ create_site() {
     fi
     sudo chown -R "$FRAPPE_USER:$FRAPPE_USER" "$BENCH_DIR/sites/$SITE_NAME"
     bench use "$SITE_NAME"
-    bench --site "$SITE_NAME" migrate
-    ok "Existing MariaDB data reconnected; ERPNext schema migrated."
+    info "Existing database and site files reconnected. Migration is deferred until the existing app code is fetched."
   else
     step "9/9" "Creating ${SITE_NAME} and installing Frappe Framework"
     # A failed Frappe site bootstrap can leave its generated random database behind
@@ -849,21 +893,34 @@ create_site() {
   fi
 }
 
+site_has_app() {
+  local app="$1"
+  bench --site "$SITE_NAME" list-apps 2>/dev/null | awk 'NF {print $1}' | grep -Fxq "$app"
+}
+
 install_erpnext_and_optional_apps() {
   section "ERPNext + official apps"
   cd "$BENCH_DIR"
   if [[ "$ERP_VERSION" -eq 15 ]]; then
     step "8/9" "Fetching Payments ${APP_BRANCH_15[payments]}"
     bench get-app --branch "${APP_BRANCH_15[payments]}" "$PAYMENTS_REPO"
-    bench --site "$SITE_NAME" install-app payments
-    ok "Payments installed for ERPNext v15."
+    if site_has_app payments; then
+      info "Payments is already installed on the preserved site; installation skipped."
+    else
+      bench --site "$SITE_NAME" install-app payments
+      ok "Payments installed for ERPNext v15."
+    fi
   fi
   step "8/9" "Fetching ERPNext ${F_BRANCH[$ERP_VERSION]}"
   bench get-app --branch "${F_BRANCH[$ERP_VERSION]}" --resolve-deps "$ERPNEXT_REPO"
-  step "8/9" "Installing ERPNext on $SITE_NAME"
-  bench --site "$SITE_NAME" install-app erpnext
+  step "8/9" "Checking ERPNext installation on $SITE_NAME"
+  if site_has_app erpnext; then
+    info "ERPNext is already installed on the preserved site; duplicate installation skipped."
+  else
+    bench --site "$SITE_NAME" install-app erpnext
+    ok "ERPNext installed."
+  fi
   bench --site "$SITE_NAME" migrate
-  ok "ERPNext installed."
   optional_apps
   # Regenerate Supervisor/Nginx configuration after optional apps are present,
   # then reload Supervisor so the production stack reflects the final bench.
@@ -914,8 +971,12 @@ optional_apps() {
 
     info "Installing selected ${labels[$app]} (${branch})"
     bench get-app --branch "$branch" "${APP_REPO[$app]}"
-    bench --site "$SITE_NAME" install-app "$app"
-    ok "${labels[$app]} installed."
+    if site_has_app "$app"; then
+      info "${labels[$app]} is already installed on the preserved site; duplicate installation skipped."
+    else
+      bench --site "$SITE_NAME" install-app "$app"
+      ok "${labels[$app]} installed."
+    fi
   done
 }
 
@@ -993,7 +1054,7 @@ production_setup() {
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ansible fail2ban nginx supervisor
   command -v ansible >/dev/null || die "Ansible is not available after installation."
   command -v supervisord >/dev/null || die "Supervisor is not available after installation."
-  command -v nginx >/dev/null || die "Nginx is not available after installation."
+  [[ -x /usr/sbin/nginx ]] || command -v nginx >/dev/null 2>&1 || die "Nginx is not available after installation."
   command -v certbot >/dev/null || die "Certbot is required by Bench sudoers setup and was not installed."
 
   step "P2/4" "Generating Redis, Socket.IO and Supervisor configuration"
