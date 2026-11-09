@@ -127,10 +127,16 @@ APP_REPO[hrms]="https://github.com/frappe/hrms.git"
 APP_REPO[education]="https://github.com/frappe/education.git"
 APP_REPO[healthcare]="https://github.com/frappe/health.git"
 APP_REPO[payments]="$PAYMENTS_REPO"
+APP_REPO[crm]="https://github.com/frappe/crm.git"
+APP_REPO[insights]="https://github.com/frappe/insights.git"
+APP_REPO[helpdesk]="https://github.com/frappe/helpdesk.git"
+APP_REPO[lms]="https://github.com/frappe/lms.git"
 
 declare -A APP_BRANCH_15 APP_BRANCH_16
 APP_BRANCH_15[hrms]="version-15"; APP_BRANCH_15[education]="version-15.2"; APP_BRANCH_15[healthcare]="version-15"; APP_BRANCH_15[payments]="version-15"
+APP_BRANCH_15[crm]="version-15"; APP_BRANCH_15[insights]="version-3"; APP_BRANCH_15[helpdesk]="version-15"; APP_BRANCH_15[lms]="version-15"
 APP_BRANCH_16[hrms]="version-16"; APP_BRANCH_16[education]="version-16"; APP_BRANCH_16[healthcare]="version-16"; APP_BRANCH_16[payments]=""
+APP_BRANCH_16[crm]="version-16"; APP_BRANCH_16[insights]="version-3"; APP_BRANCH_16[helpdesk]="version-16"; APP_BRANCH_16[lms]="version-16"
 
 ERP_VERSION=""
 BENCH_DIR=""
@@ -397,11 +403,18 @@ ask_settings() {
     unset DB_ROOT_PASSWORD_2
   fi
 
-  read -rsp "  Enter ERPNext Administrator password: " ADMIN_PASSWORD; echo
-  read -rsp "  Confirm ERPNext Administrator password: " ADMIN_PASSWORD_2; echo
-  [[ "$ADMIN_PASSWORD" == "$ADMIN_PASSWORD_2" && -n "$ADMIN_PASSWORD" ]] \
-    || die "Administrator passwords do not match or are empty."
-  unset ADMIN_PASSWORD_2
+  if [[ "$REUSE_EXISTING_DB" -eq 1 ]]; then
+    # Recovery reconnects the original site; it must retain the existing
+    # Administrator password and must not prompt for or reset it.
+    ADMIN_PASSWORD=""
+    info "Existing ERPNext Administrator password will be preserved; no password is required in recovery mode."
+  else
+    read -rsp "  Enter ERPNext Administrator password: " ADMIN_PASSWORD; echo
+    read -rsp "  Confirm ERPNext Administrator password: " ADMIN_PASSWORD_2; echo
+    [[ "$ADMIN_PASSWORD" == "$ADMIN_PASSWORD_2" && -n "$ADMIN_PASSWORD" ]] \
+      || die "Administrator passwords do not match or are empty."
+    unset ADMIN_PASSWORD_2
+  fi
 
   echo
   read -rp "  Configure production services (nginx + supervisor)? [y/N]: " PRODUCTION
@@ -423,6 +436,26 @@ ask_settings() {
   read -rp "  Install Healthcare? [y/N]: " app_answer
   if [[ "$app_answer" =~ ^[Yy]$ ]]; then
     OPTIONAL_APPS_SELECTED+=(healthcare)
+  fi
+
+  read -rp "  Install Frappe CRM? [y/N]: " app_answer
+  if [[ "$app_answer" =~ ^[Yy]$ ]]; then
+    OPTIONAL_APPS_SELECTED+=(crm)
+  fi
+
+  read -rp "  Install Frappe Insights (BI / dashboards)? [y/N]: " app_answer
+  if [[ "$app_answer" =~ ^[Yy]$ ]]; then
+    OPTIONAL_APPS_SELECTED+=(insights)
+  fi
+
+  read -rp "  Install Frappe Helpdesk? [y/N]: " app_answer
+  if [[ "$app_answer" =~ ^[Yy]$ ]]; then
+    OPTIONAL_APPS_SELECTED+=(helpdesk)
+  fi
+
+  read -rp "  Install Frappe Learning (LMS)? [y/N]: " app_answer
+  if [[ "$app_answer" =~ ^[Yy]$ ]]; then
+    OPTIONAL_APPS_SELECTED+=(lms)
   fi
 
   # With `set -e`, the final false test in a `[[ ... ]] && ...` list can
@@ -920,8 +953,9 @@ install_erpnext_and_optional_apps() {
     bench --site "$SITE_NAME" install-app erpnext
     ok "ERPNext installed."
   fi
-  bench --site "$SITE_NAME" migrate
+  ensure_existing_site_apps
   optional_apps
+  bench --site "$SITE_NAME" migrate
   # Regenerate Supervisor/Nginx configuration after optional apps are present,
   # then reload Supervisor so the production stack reflects the final bench.
   if [[ "$PRODUCTION" =~ ^[Yy]$ ]]; then
@@ -955,10 +989,46 @@ official_app_available() {
   git ls-remote --exit-code --heads "${APP_REPO[$app]}" "$branch" >/dev/null 2>&1
 }
 
+ensure_existing_site_apps() {
+  # During Option 1 recovery, every app recorded in the preserved site's
+  # installed-app list must have its source code restored before migration.
+  # Do not depend on the user's optional-app answers for already-installed apps.
+  [[ "$REUSE_EXISTING_DB" -eq 1 ]] || return 0
+  section "Restoring existing site apps"
+  local app branch
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    case "$app" in
+      frappe|erpnext) continue ;;
+    esac
+
+    if [[ -z "${APP_REPO[$app]:-}" ]]; then
+      die "Existing site has installed app '$app', but no official repository mapping exists in this installer. Migration stopped safely; add its source before retrying."
+    fi
+
+    branch="$(app_branch "$app")"
+    [[ -n "$branch" ]] || die "Existing app '$app' has no verified branch mapping for ERPNext v${ERP_VERSION}; migration stopped safely."
+    if ! official_app_available "$app"; then
+      die "Existing app '$app' branch '$branch' is not available from its configured repository; migration stopped safely."
+    fi
+
+    if [[ ! -d "$BENCH_DIR/apps/$app" ]]; then
+      info "Restoring source for existing app '$app' (${branch}) before migration."
+      bench get-app --branch "$branch" "${APP_REPO[$app]}"
+    else
+      info "Source for existing app '$app' is already present."
+    fi
+  done < <(bench --site "$SITE_NAME" list-apps | awk 'NF {print $1}')
+}
+
 optional_apps() {
   section "Optional official Frappe apps"
   local app branch
-  local -A labels=([hrms]="Frappe HR" [education]="Education" [healthcare]="Healthcare")
+  local -A labels=(
+    [hrms]="Frappe HR" [education]="Education" [healthcare]="Healthcare"
+    [crm]="Frappe CRM" [insights]="Frappe Insights" [helpdesk]="Frappe Helpdesk"
+    [lms]="Frappe Learning"
+  )
 
   for app in "${OPTIONAL_APPS_SELECTED[@]}"; do
     branch="$(app_branch "$app")"
@@ -969,11 +1039,14 @@ optional_apps() {
       continue
     fi
 
-    info "Installing selected ${labels[$app]} (${branch})"
-    bench get-app --branch "$branch" "${APP_REPO[$app]}"
+    if [[ ! -d "$BENCH_DIR/apps/$app" ]]; then
+      info "Fetching selected ${labels[$app]} (${branch})"
+      bench get-app --branch "$branch" "${APP_REPO[$app]}"
+    fi
     if site_has_app "$app"; then
       info "${labels[$app]} is already installed on the preserved site; duplicate installation skipped."
     else
+      info "Installing selected ${labels[$app]} (${branch})"
       bench --site "$SITE_NAME" install-app "$app"
       ok "${labels[$app]} installed."
     fi
@@ -1139,8 +1212,35 @@ final_checks() {
       die "One or more production Supervisor programs are not healthy."
     fi
     sudo nginx -t >/dev/null || die "Final Nginx configuration test failed."
-    curl -fsSI -H "Host: ${SITE_NAME}" "http://127.0.0.1:${WEB_PORT}/" >/dev/null \
-      || die "Frappe web endpoint did not respond on ${WEB_PORT} for Host ${SITE_NAME}."
+    # Read the effective web port from the generated site-wide config. This
+    # avoids a false failure if the installer-selected port and the persisted
+    # Bench config differ after recovery or a previous installation.
+    local health_port="$WEB_PORT"
+    if [[ -f "$BENCH_DIR/sites/common_site_config.json" ]]; then
+      health_port="$(python3 - "$BENCH_DIR/sites/common_site_config.json" "$WEB_PORT" <<'PYPORT'
+import json, sys
+path, fallback = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as f:
+        value = json.load(f).get("webserver_port", fallback)
+    value = str(value)
+    print(value if value.isdigit() else fallback)
+except Exception:
+    print(fallback)
+PYPORT
+)"
+    fi
+    local web_ready=0
+    for _ in $(seq 1 30); do
+      if curl --connect-timeout 2 --max-time 5 -fsSI \
+          -H "Host: ${SITE_NAME}" "http://127.0.0.1:${health_port}/" >/dev/null 2>&1; then
+        web_ready=1
+        break
+      fi
+      sleep 2
+    done
+    (( web_ready == 1 )) || die "Frappe web endpoint did not respond on configured port ${health_port} for Host ${SITE_NAME} after 60 seconds."
+    ok "Frappe web endpoint responded on configured port ${health_port} for Host ${SITE_NAME}."
   fi
 
   echo
